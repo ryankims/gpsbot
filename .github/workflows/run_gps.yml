@@ -1,0 +1,35 @@
+name: GPS Robot
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'  # 20분마다 실행 (0분, 20분, 40분)
+# 1시간마다 실행 (원하면 시간 조정 가능)
+  workflow_dispatch:      # 내가 원할 때 버튼 눌러서 실행 가능
+
+jobs:
+  run-gps-script:
+    runs-on: ubuntu-latest
+    
+    # 1단계에서 만든 금고(Secrets)를 여기서 연결해줍니다!
+    env:
+      KAKAO_API_KEY: ${{ secrets.KAKAO_API_KEY }}
+      GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+      NOTION_KEY: ${{ secrets.NOTION_KEY }}
+      NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+      GDRIVE_SA_KEY: ${{ secrets.GDRIVE_SA_KEY }}
+
+    steps:
+      - name: 코드 가져오기
+        uses: actions/checkout@v3
+
+      - name: 파이썬 설치
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: 라이브러리 설치
+        run: |
+          pip install pandas requests google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client
+
+      - name: 프로그램 실행
+        run: python main.py
