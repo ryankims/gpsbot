@@ -10,15 +10,23 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# ★ [핵심] secrets.py 파일에서 변수들을 가져옵니다!
-# (secrets.py 파일이 같은 폴더에 있어야 합니다)
+# ================= [비밀번호 로드: 하이브리드 방식] =================
+# 1. 먼저 내 컴퓨터(secrets.py)에 있는지 확인해봅니다.
 try:
     from secrets import MY_KAKAO_KEY, MY_FOLDER_ID, MY_NOTION_KEY, MY_NOTION_DB_ID
-except ImportError:
-    print("⚠️ 'secrets.py' 파일을 찾을 수 없습니다. 비밀번호 파일을 만들어주세요.")
-    exit()
+    GDRIVE_SA_KEY = None # 로컬에서는 파일로 처리하므로 변수는 비워둠
+    print("💻 내 컴퓨터 모드로 실행합니다. (secrets.py 사용)")
 
-# ===================================================
+# 2. 없으면(Github 서버라면) 환경변수(Secrets)에서 가져옵니다.
+except ImportError:
+    MY_KAKAO_KEY = os.environ.get("KAKAO_API_KEY")
+    MY_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
+    MY_NOTION_KEY = os.environ.get("NOTION_KEY")
+    MY_NOTION_DB_ID = os.environ.get("NOTION_DB_ID")
+    GDRIVE_SA_KEY = os.environ.get("GDRIVE_SA_KEY")
+    print("☁️ Github 서버 모드로 실행합니다. (Secrets 사용)")
+
+# ===================================================================
 
 # [기본 규칙]
 MY_TAG_RULES = {
@@ -34,14 +42,13 @@ STAY_RADIUS = 100
 MIN_STAY_MINUTES = 5
 
 def get_credentials():
-    # 1. service_account.json 파일이 있으면 사용
+    # 1. (내 컴퓨터) service_account.json 파일이 있으면 사용
     if os.path.exists('service_account.json'):
         return service_account.Credentials.from_service_account_file('service_account.json', scopes=['https://www.googleapis.com/auth/drive.readonly'])
     
-    # 2. (Github용) 환경변수에 GDRIVE_SA_KEY가 있으면 사용
-    # 이건 나중에 Github Actions 쓸 때만 필요하니 지금은 무시하셔도 됩니다.
-    elif os.environ.get("GDRIVE_SA_KEY"):
-        info = json.loads(os.environ.get("GDRIVE_SA_KEY"))
+    # 2. (Github 서버) 환경변수에 내용이 들어있으면 사용
+    elif GDRIVE_SA_KEY:
+        info = json.loads(GDRIVE_SA_KEY)
         return service_account.Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/drive.readonly'])
     return None
 
@@ -235,7 +242,7 @@ def download_latest_file():
     return pd.read_csv(fh), target_file['name']
 
 def main():
-    print("🚀 [GPS 분석기] 안전한 Github 업로드 버전...")
+    print("🚀 [GPS 분석기] 하이브리드 모드 가동...")
     
     existing_timestamps, name_tag_memory = sync_fix_and_learn()
     print(f"🧠 학습된 태그 규칙: {len(name_tag_memory)}개")
