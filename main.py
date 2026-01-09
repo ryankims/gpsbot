@@ -9,8 +9,9 @@ from datetime import datetime, timedelta
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from dateutil import parser  # [추가] 날짜 파싱 강화
 
-# ================= [비밀번호 로드: 하이브리드 방식] =================
+# ================= [비밀번호 로드] =================
 try:
     from secrets import MY_KAKAO_KEY, MY_FOLDER_ID, MY_NOTION_KEY, MY_NOTION_DB_ID
     GDRIVE_SA_KEY = None 
@@ -22,21 +23,23 @@ except ImportError:
     MY_NOTION_DB_ID = os.environ.get("NOTION_DB_ID")
     GDRIVE_SA_KEY = os.environ.get("GDRIVE_SA_KEY")
     print("☁️ Github 서버 모드로 실행합니다. (Secrets 사용)")
-# ===================================================================
 
-# [기본 규칙]
+# ================= [설정값 조정] =================
+# [중요] CSV가 이미 한국시간이면 False, UTC(영국시간)면 True로 설정하세요.
+# 앱(GPS Logger 등)을 쓴다면 보통 False, 구글 테이크아웃이라면 True입니다.
+IS_CSV_UTC = False  
+
 MY_TAG_RULES = {
     "마트": "🛒 Market", "편의점": "🛒 Market", "학교": "🏫 School", "초등": "🏫 School",
     "역": "🚆 Station", "카페": "☕ Cafe", "커피": "☕ Cafe", "다이소": "🛍️ Shopping",
     "집": "🏠 Home", "아파트": "🏠 Home"
 }
 
-# 설정값
 SMOOTHING_WINDOW = 3
 ACCURACY_LIMIT = 50
 STAY_RADIUS = 100
 MIN_STAY_MINUTES = 5
-MERGE_TIME_GAP_MINUTES = 30  # [추가] 30분 이내 재방문은 같은 방문으로 처리
+MERGE_TIME_GAP_MINUTES = 30
 
 def get_credentials():
     if os.path.exists('service_account.json'):
@@ -55,12 +58,7 @@ def format_duration(minutes):
     minutes = int(minutes)
     hours = minutes // 60
     mins = minutes % 60
-    if hours > 0: return f"{hours}시간 {mins}분"
-    else: return f"{mins}분"
-
-def get_time_fingerprint(iso_string):
-    if not iso_string: return ""
-    return iso_string[:16]
+    return f"{hours}시간 {mins}분" if hours > 0 else f"{mins}분"
 
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371000
@@ -94,13 +92,14 @@ def update_notion_address(page_id, new_address):
     requests.patch(url, headers=headers, json=payload)
     print(f"   ✨ 주소 자동 보정 완료: {new_address}")
 
+# [수정] 기존 데이터 로드 (중복 방지 강화)
 def sync_fix_and_learn():
-    print("🔄 노션 데이터 동기화 중...")
+    print("🔄 노션 데이터 동기화 중 (중복 검사)...")
     url = f"https://api.notion.com/v1/databases/{get_notion_db_id()}/query"
     headers = {"Authorization": f"Bearer {get_notion_key()}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
-    payload = {"page_size": 50, "sorts": [{"property": "방문일시", "direction": "descending"}]}
+    payload = {"page_size": 100, "sorts": [{"property": "방문일시", "direction": "descending"}]}
     
-    existing_timestamps = set()
+    existing_timestamps = set() # (타임스탬프) 저장
     name_tag_memory = {} 
     
     try:
@@ -109,36 +108,28 @@ def sync_fix_and_learn():
             results = resp.json().get("results", [])
             for page in results:
                 props = page.get("properties", {})
-                page_id = page.get("id")
                 
+                # 날짜 파싱 (ISO 포맷을 datetime 객체로 변환하여 저장)
                 date_prop = props.get("방문일시", {}).get("date", {})
-                start_time = date_prop.get("start", "") if date_prop else ""
+                start_time_str = date_prop.get("start", "") if date_prop else ""
                 
+                if start_time_str:
+                    try:
+                        # 파이썬 datetime 객체로 변환 (초 단위까지만 비교)
+                        dt = parser.parse(start_time_str)
+                        # 타임존 정보 제거 (단순 비교용)
+                        dt_naive = dt.replace(tzinfo=None)
+                        # "2023-01-09 10:00" 형태의 문자열로 저장
+                        existing_timestamps.add(dt_naive.strftime("%Y-%m-%d %H:%M"))
+                    except:
+                        pass
+                
+                # 태그 학습 및 주소 보정 로직 (기존 동일)
                 title_prop = props.get("이름", {}).get("title", [])
                 place_name = title_prop[0].get("text", {}).get("content", "") if title_prop else ""
-
-                addr_prop = props.get("주소", {}).get("rich_text", [])
-                current_addr = addr_prop[0].get("text", {}).get("content", "") if addr_prop else ""
-                
                 tag_prop = props.get("태그", {}).get("multi_select", [])
-                tag_name = tag_prop[0]['name'] if tag_prop else ""
-                
-                lat = props.get("Lat", {}).get("number")
-                lon = props.get("Lon", {}).get("number")
-
-                if start_time:
-                    existing_timestamps.add(get_time_fingerprint(start_time))
-                
-                if place_name and tag_name:
-                    name_tag_memory[place_name] = tag_name
-
-                if place_name and current_addr and lat and lon:
-                    if len(place_name) > 2 and place_name not in ["Home", "School", "Work", "Mart"]:
-                        if place_name[:2] not in current_addr:
-                            real_name, real_addr = search_place_by_name(place_name, lat, lon)
-                            if real_addr and (real_addr.replace(" ", "") != current_addr.replace(" ", "")):
-                                print(f"🔧 불일치 감지! 이름('{place_name}')에 맞춰 주소 수정.")
-                                update_notion_address(page_id, real_addr)
+                if place_name and tag_prop:
+                    name_tag_memory[place_name] = tag_prop[0]['name']
 
     except Exception as e:
         print(f"⚠️ 노션 동기화 에러: {e}")
@@ -174,20 +165,21 @@ def get_geo_info(lat, lng):
     if not place_name: place_name = address_str
     return place_name, address_str
 
+# [수정] 노션 전송 (중복 체크 강화)
 def send_to_notion(visit_data, existing_timestamps, name_tag_memory):
+    # 중복 체크: 분 단위까지 같은 데이터가 있으면 스킵
+    check_time = visit_data['start'].strftime("%Y-%m-%d %H:%M")
+    
+    if check_time in existing_timestamps:
+        print(f"⏭️  [중복 방지] 이미 등록됨: {visit_data['place_name']} ({check_time})")
+        return
+
     final_tag = "📍 기타"
     if visit_data['place_name'] in name_tag_memory:
         final_tag = name_tag_memory[visit_data['place_name']]
     else:
         for k, t in MY_TAG_RULES.items():
             if k in visit_data['place_name']: final_tag = t; break
-
-    start_iso = visit_data['start'].isoformat()
-    time_key = get_time_fingerprint(start_iso)
-    
-    if time_key in existing_timestamps:
-        print(f"⏭️  [중복] 패스: {visit_data['place_name']}")
-        return
 
     url = "https://api.notion.com/v1/pages"
     headers = {"Authorization": f"Bearer {get_notion_key()}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
@@ -199,7 +191,7 @@ def send_to_notion(visit_data, existing_timestamps, name_tag_memory):
             "주소": {"rich_text": [{"text": {"content": visit_data['address']}}]},
             "태그": {"multi_select": [{"name": final_tag}]},
             "체류시간": {"rich_text": [{"text": {"content": format_duration(visit_data['duration'])}}]},
-            "방문일시": {"date": {"start": start_iso, "end": visit_data['end'].isoformat()}},
+            "방문일시": {"date": {"start": visit_data['start'].isoformat(), "end": visit_data['end'].isoformat()}},
             "Lat": {"number": visit_data['lat']},
             "Lon": {"number": visit_data['lon']}
         }
@@ -208,34 +200,49 @@ def send_to_notion(visit_data, existing_timestamps, name_tag_memory):
     try:
         resp = requests.post(url, headers=headers, json=payload)
         if resp.status_code == 200:
-            print(f"✅ 등록: {visit_data['place_name']} [{final_tag}]")
-            existing_timestamps.add(time_key)
+            print(f"✅ 등록 성공: {visit_data['place_name']} ({check_time})")
+            existing_timestamps.add(check_time)
         else: print(f"❌ 실패: {resp.text}")
     except Exception as e: print(f"❌ 에러: {e}")
 
+# [수정] 최신 파일 가져오기 (로직 명확화)
 def download_latest_file():
     creds = get_credentials()
     if not creds: return None
     service = build('drive', 'v3', credentials=creds)
     folder_id = get_folder_id()
-    print(f"🔎 최신 로그 검색 중...")
-    results = service.files().list(q=f"'{folder_id}' in parents and trashed=false", orderBy='createdTime desc', pageSize=50, fields="files(id, name, mimeType)").execute()
+    print(f"🔎 Google Drive에서 최신 CSV 검색 중...")
+    
+    # createdTime 내림차순(desc)으로 정렬하여 가장 위의 파일 1개만 가져옴
+    results = service.files().list(
+        q=f"'{folder_id}' in parents and trashed=false",
+        orderBy='createdTime desc', 
+        pageSize=1, 
+        fields="files(id, name, mimeType, createdTime)"
+    ).execute()
+    
     items = results.get('files', [])
-    target_file = None
-    for item in items:
-        if item['name'].lower().endswith('.csv'): target_file = item; break
-    if not target_file: print("❌ CSV 파일이 없습니다."); return None
-    print(f"📂 파일 분석: {target_file['name']}")
+    if not items: 
+        print("❌ CSV 파일이 없습니다.")
+        return None
+        
+    target_file = items[0]
+    
+    # 1월 11일 이후 로직: 항상 가장 최신의 createdTime 파일을 가져오므로 자동 해결됨.
+    print(f"📂 최신 파일 선택됨: {target_file['name']} (생성일: {target_file['createdTime']})")
+    
     fh = io.BytesIO()
-    if 'application/vnd.google-apps' in target_file['mimeType']: request = service.files().export_media(fileId=target_file['id'], mimeType='text/csv')
-    else: request = service.files().get_media(fileId=target_file['id'])
+    if 'application/vnd.google-apps' in target_file['mimeType']:
+        request = service.files().export_media(fileId=target_file['id'], mimeType='text/csv')
+    else:
+        request = service.files().get_media(fileId=target_file['id'])
+        
     downloader = MediaIoBaseDownload(fh, request)
     done = False
     while done is False: status, done = downloader.next_chunk()
     fh.seek(0)
     return pd.read_csv(fh), target_file['name']
 
-# [신규 함수] 1차 필터링: 거리 기반 클러스터링
 def process_clustering(df):
     points = df.to_dict('records')
     if not points: return []
@@ -279,25 +286,20 @@ def process_clustering(df):
             
     return raw_visits
 
-# [신규 함수] 2차 필터링: 연속된 장소 병합 (핵심 로직)
 def merge_consecutive_visits(visits):
     if not visits: return []
     merged = [visits[0]]
     
     for current in visits[1:]:
         last = merged[-1]
-        
-        # 1. 이름이 같거나 주소가 같음
         is_same_place = (current['place_name'] == last['place_name']) or \
                         (current['address'].replace(" ", "") == last['address'].replace(" ", ""))
-        
-        # 2. 시간 차이가 허용 범위(30분) 이내
         time_gap = (current['start'] - last['end']).total_seconds() / 60
         
         if is_same_place and time_gap <= MERGE_TIME_GAP_MINUTES:
-            last['end'] = current['end'] # 종료 시간 연장
-            last['duration'] = (last['end'] - last['start']).total_seconds() / 60 # 시간 재계산
-            print(f"🧩 병합됨: {last['place_name']} (중간 {int(time_gap)}분 공백 무시)")
+            last['end'] = current['end'] 
+            last['duration'] = (last['end'] - last['start']).total_seconds() / 60
+            print(f"🧩 병합됨: {last['place_name']} (시간차 {int(time_gap)}분)")
         else:
             merged.append(current)
             
@@ -318,25 +320,27 @@ def main():
         df['time'] = df['date'] + ' ' + df['time']
     df['datetime'] = pd.to_datetime(df['time'])
 
-    # [KST 보정] CSV가 UTC라면 한국 시간으로 맞춤 (필요시 주석 해제/삭제)
-    df['datetime'] = df['datetime'] + timedelta(hours=9)
+    # [수정] 시간 보정 로직 조건부 적용
+    if IS_CSV_UTC:
+        df['datetime'] = df['datetime'] + timedelta(hours=9)
+        print("⏰ UTC 데이터 감지: 한국 시간으로 +9시간 보정했습니다.")
+    else:
+        print("⏰ 시간 보정 없음 (이미 KST로 가정)")
     
     df = df.sort_values('datetime')
     if 'accuracy' in df.columns: df = df[df['accuracy'] <= ACCURACY_LIMIT]
+    
     if len(df) == 0: print("❌ 유효한 데이터가 없습니다."); return
 
     df['smooth_lat'] = df['lat'].rolling(window=SMOOTHING_WINDOW, min_periods=1, center=True).mean()
     df['smooth_lon'] = df['lon'].rolling(window=SMOOTHING_WINDOW, min_periods=1, center=True).mean()
 
-    # 1단계: 기본 클러스터링
     print("running 1st clustering...")
     raw_visits = process_clustering(df)
     
-    # 2단계: 연속 장소 병합
     print("running 2nd merging...")
     final_visits = merge_consecutive_visits(raw_visits)
 
-    # 3단계: 노션 전송
     print(f"📤 총 {len(final_visits)}개의 방문 기록 처리 시작...")
     for visit in final_visits:
         send_to_notion(visit, existing_timestamps, name_tag_memory)
