@@ -11,22 +11,12 @@ from googleapiclient.http import MediaIoBaseDownload
 from dateutil import parser
 
 # ================= [설정값] =================
-AUTO_SWITCH_DATE = date(2026, 1, 10)
-
 STAY_TIME_MIN = 10
 STAY_RADIUS = 30
 MERGE_TIME_GAP_MINUTES = 30
 
 SMOOTHING_WINDOW = 3
 ACCURACY_LIMIT = 50
-
-MY_TAG_RULES = {
-    "마트": "🛒 Market", "편의점": "🛒 Market",
-    "학교": "🏫 School",
-    "역": "🚆 Station",
-    "카페": "☕ Cafe",
-    "집": "🏠 Home"
-}
 
 # ================= [비밀키 로드] =================
 try:
@@ -85,7 +75,10 @@ def load_existing_notion():
     for r in res.get("results", []):
         d = r["properties"]["방문일시"]["date"]
         if d and d["start"]:
-            existing.append(parser.parse(d["start"]).replace(tzinfo=None))
+            dt = parser.parse(d["start"])
+            if dt.tzinfo:
+                dt = dt.astimezone(None).replace(tzinfo=None)
+            existing.append(dt)
 
     return existing
 
@@ -134,7 +127,7 @@ def detect_stays(df):
 
     return stays
 
-# ================= [Drive 파일 로드 핵심 수정부] =================
+# ================= [Drive 파일 로드] =================
 def download_target_files():
     service = build("drive", "v3", credentials=get_credentials())
 
@@ -150,16 +143,10 @@ def download_target_files():
     for f in res["files"]:
         fh = io.BytesIO()
 
-        # ✅ CSV 파일
         if f["mimeType"] == "text/csv":
             req = service.files().get_media(fileId=f["id"])
-
-        # ✅ Google Sheets → CSV Export
         elif f["mimeType"] == "application/vnd.google-apps.spreadsheet":
-            req = service.files().export_media(
-                fileId=f["id"],
-                mimeType="text/csv"
-            )
+            req = service.files().export_media(fileId=f["id"], mimeType="text/csv")
         else:
             continue
 
@@ -169,8 +156,7 @@ def download_target_files():
             _, done = downloader.next_chunk()
 
         fh.seek(0)
-        df = pd.read_csv(fh, encoding="utf-8-sig")
-        results.append(df)
+        results.append(pd.read_csv(fh, encoding="utf-8-sig"))
 
     return results
 
@@ -205,7 +191,7 @@ def main():
 
     for df in dfs:
         df.columns = df.columns.str.lower()
-        df["datetime"] = pd.to_datetime(df["time"])
+        df["datetime"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
         df = df.sort_values("datetime")
 
         if "accuracy" in df.columns:
