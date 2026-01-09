@@ -14,7 +14,6 @@ from dateutil import parser
 # ================= [설정값 최적화] =================
 AUTO_SWITCH_DATE = date(2026, 1, 10) 
 
-# 너무 좁은 반경은 장소 파편화의 원인이 됩니다. 50m로 원복을 권장합니다.
 STAY_RADIUS = 50       
 MIN_STAY_MINUTES = 5   
 MERGE_TIME_GAP_MINUTES = 30  
@@ -70,9 +69,10 @@ def sync_fix_and_learn():
     url = f"https://api.notion.com/v1/databases/{MY_NOTION_DB_ID}/query"
     headers = {"Authorization": f"Bearer {MY_NOTION_KEY}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     
+    # 중복 체크를 위해 넉넉하게 최근 기록을 가져옵니다.
     payload = {"page_size": 100, "sorts": [{"property": "방문일시", "direction": "descending"}]}
     
-    existing_records = [] # (start_time, end_time, place_name)
+    existing_records = []
     name_tag_memory = {} 
     
     try:
@@ -129,7 +129,6 @@ def get_geo_info(lat, lng):
 def send_to_notion(visit_data, existing_records, name_tag_memory):
     new_start = visit_data['start'].replace(tzinfo=None)
     
-    # 중복 체크 강화: 시간대가 5분 이내로 겹치면 중복 처리
     for rec in existing_records:
         if abs((new_start - rec['start']).total_seconds()) < 300:
             print(f"🛡️ [중복 차단] {visit_data['place_name']} ({new_start.strftime('%m/%d %H:%M')})")
@@ -166,16 +165,29 @@ def send_to_notion(visit_data, existing_records, name_tag_memory):
         else: print(f"❌ 실패: {resp.text}")
     except Exception as e: print(f"❌ 에러: {e}")
 
+# [핵심 수정] 날짜 조건에 따라 파일 수집 개수를 조절합니다.
 def download_target_files():
     creds = get_credentials()
     if not creds: return []
     service = build('drive', 'v3', credentials=creds)
     
+    today = datetime.now().date()
+    
+    # 1월 10일 전이라면 과거 데이터를 싹 긁어오기 위해 정렬 및 개수를 조정합니다.
+    if today < AUTO_SWITCH_DATE:
+        print(f"📂 [과거 데이터 모드] 1월 9일 이전의 모든 파일을 가져옵니다.")
+        order_by = 'createdTime asc' # 과거 파일부터 순서대로
+        page_size = 100 # 넉넉하게 모든 파일 스캔
+    else:
+        print(f"📂 [최신 데이터 모드] 최신 파일 1개만 처리합니다.")
+        order_by = 'createdTime desc'
+        page_size = 1
+        
     results = service.files().list(
         q=f"'{MY_FOLDER_ID}' in parents and trashed=false",
         fields="files(id, name, mimeType, createdTime)",
-        orderBy='createdTime desc',
-        pageSize=1 # 일단 가장 최신 파일 하나만 정확히 처리합시다
+        orderBy=order_by,
+        pageSize=page_size
     ).execute()
     
     items = results.get('files', [])
@@ -184,7 +196,8 @@ def download_target_files():
     for item in items:
         if not (item['name'].lower().endswith('.csv') or item['mimeType'] == 'application/vnd.google-apps.spreadsheet'):
             continue
-        print(f"   ⬇️ 다운로드 중: {item['name']}")
+            
+        print(f"   ⬇️ 다운로드 중: {item['name']} (생성일: {item['createdTime']})")
         fh = io.BytesIO()
         try:
             if item['mimeType'] == 'application/vnd.google-apps.spreadsheet':
@@ -199,6 +212,7 @@ def download_target_files():
             downloaded_files.append((df, item['name']))
         except Exception as e:
             print(f"   ❌ {item['name']} 다운로드 실패: {e}")
+            
     return downloaded_files
 
 def process_clustering(df):
@@ -225,7 +239,6 @@ def merge_consecutive_visits(visits):
     merged = [visits[0]]
     for current in visits[1:]:
         last = merged[-1]
-        # 장소명이 같거나 주소가 유사하면 병합
         is_same_place = (current['place_name'] == last['place_name']) or (current['address'][:10] == last['address'][:10])
         time_gap = (current['start'] - last['end']).total_seconds() / 60
         if is_same_place and time_gap <= MERGE_TIME_GAP_MINUTES:
@@ -234,11 +247,14 @@ def merge_consecutive_visits(visits):
     return merged
 
 def main():
-    print(f"🚀 GPS 분석기 안정화 버전 (반경:{STAY_RADIUS}m)")
+    print(f"🚀 GPS 분석기 가동 (반경:{STAY_RADIUS}m)")
     existing_records, name_tag_memory = sync_fix_and_learn()
     file_list = download_target_files()
     
+    print(f"📦 총 {len(file_list)}개의 파일을 분석합니다.")
+    
     for df, filename in file_list:
+        print(f"\n📄 [분석 중] {filename}")
         df.columns = df.columns.str.strip().str.lower()
         if 'time' not in df.columns and 'date' in df.columns: df['time'] = df['date'] + ' ' + df['time']
         df['datetime'] = pd.to_datetime(df['time'])
