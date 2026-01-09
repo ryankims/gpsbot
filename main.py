@@ -26,13 +26,13 @@ except ImportError:
 
 # ================= [핵심 설정값] =================
 AUTO_SWITCH_DATE = date(2026, 1, 10) # 1월 10일부터 최신 파일 1개만 처리
-IS_CSV_UTC = False  # CSV 시간이 한국시간이면 False
 
 # [사용자 요청 반영]
-STAY_RADIUS = 50       # 반경 50m (정밀도 향상)
-MIN_STAY_MINUTES = 5   # 5분 이상 머물러야 방문으로 기록
-MERGE_TIME_GAP_MINUTES = 30 # 30분 내 재방문은 하나로 합침
+STAY_RADIUS = 50       # 반경 50m
+MIN_STAY_MINUTES = 5   # 5분 이상 체류 시 기록
+MERGE_TIME_GAP_MINUTES = 30 
 
+IS_CSV_UTC = False  
 SMOOTHING_WINDOW = 3
 ACCURACY_LIMIT = 50
 
@@ -65,13 +65,11 @@ def haversine(lat1, lon1, lat2, lon2):
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2) * math.sin(dlambda/2)**2
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1-a))
 
-# [수정] 노션 중복 체크 로직 강화
 def sync_fix_and_learn():
     print("🔄 노션 데이터 동기화 및 중복 검사 준비 중...")
     url = f"https://api.notion.com/v1/databases/{MY_NOTION_DB_ID}/query"
     headers = {"Authorization": f"Bearer {MY_NOTION_KEY}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     
-    # 중복 방지를 위해 최근 300개까지 범위를 넓혀서 읽어옴
     payload = {"page_size": 300, "sorts": [{"property": "방문일시", "direction": "descending"}]}
     
     existing_timestamps = set() 
@@ -83,14 +81,11 @@ def sync_fix_and_learn():
             results = resp.json().get("results", [])
             for page in results:
                 props = page.get("properties", {})
-                
-                # 중복 방지용 타임스탬프 추출 (초 단위 제외하고 분까지만 비교)
                 date_prop = props.get("방문일시", {}).get("date", {})
                 if date_prop and date_prop.get("start"):
                     dt = parser.parse(date_prop["start"]).replace(tzinfo=None, second=0, microsecond=0)
                     existing_timestamps.add(dt)
                 
-                # 태그 학습용
                 title_prop = props.get("이름", {}).get("title", [])
                 p_name = title_prop[0].get("text", {}).get("content", "") if title_prop else ""
                 tag_prop = props.get("태그", {}).get("multi_select", [])
@@ -99,7 +94,6 @@ def sync_fix_and_learn():
             print(f"📊 기존 기록 {len(existing_timestamps)}개 로드 완료.")
     except Exception as e:
         print(f"⚠️ 노션 읽기 에러: {e}")
-        
     return existing_timestamps, name_tag_memory
 
 def get_geo_info(lat, lng):
@@ -131,7 +125,6 @@ def get_geo_info(lat, lng):
     return place_name, address_str
 
 def send_to_notion(visit_data, existing_timestamps, name_tag_memory):
-    # 전송 전 중복 다시 확인 (분 단위 비교)
     check_dt = visit_data['start'].replace(tzinfo=None, second=0, microsecond=0)
     if check_dt in existing_timestamps:
         print(f"🛡️ [중복 차단] {visit_data['place_name']} ({check_dt.strftime('%m/%d %H:%M')})")
@@ -164,20 +157,20 @@ def send_to_notion(visit_data, existing_timestamps, name_tag_memory):
         resp = requests.post(url, headers=headers, json=payload)
         if resp.status_code == 200:
             print(f"✅ 등록: {visit_data['place_name']} ({check_dt.strftime('%H:%M')})")
-            existing_timestamps.add(check_dt) # 메모리에 추가하여 연속 중복 방지
+            existing_timestamps.add(check_dt)
         else: print(f"❌ 실패: {resp.text}")
     except Exception as e: print(f"❌ 에러: {e}")
 
+# [핵심 수정] 403 에러 방지를 위해 구글 시트 형식 대응 로직 추가
 def download_target_files():
     creds = get_credentials()
     if not creds: return []
     service = build('drive', 'v3', credentials=creds)
     
     today = datetime.now().date()
-    # 1월 10일 전이면 모든 파일, 이후면 최신 1개
     if today < AUTO_SWITCH_DATE:
         query_params = {'orderBy': 'createdTime asc', 'pageSize': 100}
-        print("📂 [전체 모드] 모든 과거 파일을 순서대로 처리합니다.")
+        print("📂 [전체 모드] 모든 과거 파일을 처리합니다.")
     else:
         query_params = {'orderBy': 'createdTime desc', 'pageSize': 1}
         print("📂 [최신 모드] 최신 파일 1개만 처리합니다.")
@@ -190,15 +183,32 @@ def download_target_files():
     
     items = results.get('files', [])
     downloaded_files = []
+    
     for item in items:
-        if not item['name'].lower().endswith('.csv'): continue
+        # CSV 확장자이거나 구글 스프레드시트 타입인 경우만 다운로드 시도
+        if not (item['name'].lower().endswith('.csv') or item['mimeType'] == 'application/vnd.google-apps.spreadsheet'):
+            continue
+            
+        print(f"   ⬇️ 다운로드 중: {item['name']}")
         fh = io.BytesIO()
-        request = service.files().get_media(fileId=item['id'])
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while done is False: status, done = downloader.next_chunk()
-        fh.seek(0)
-        downloaded_files.append((pd.read_csv(fh), item['name']))
+        try:
+            # 구글 스프레드시트 형식일 경우 export_media 사용 (403 에러 방지)
+            if item['mimeType'] == 'application/vnd.google-apps.spreadsheet':
+                request = service.files().export_media(fileId=item['id'], mimeType='text/csv')
+            else:
+                request = service.files().get_media(fileId=item['id'])
+                
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while done is False:
+                status, done = downloader.next_chunk()
+            
+            fh.seek(0)
+            df = pd.read_csv(fh, encoding='utf-8-sig')
+            downloaded_files.append((df, item['name']))
+        except Exception as e:
+            print(f"   ❌ {item['name']} 다운로드 실패: {e}")
+            
     return downloaded_files
 
 def process_clustering(df):
@@ -240,13 +250,13 @@ def merge_consecutive_visits(visits):
     return merged
 
 def main():
-    print(f"🚀 GPS 분석기 v2.2 (반경:{STAY_RADIUS}m, 최소체류:{MIN_STAY_MINUTES}분)")
+    print(f"🚀 GPS 분석기 v2.3 (반경:{STAY_RADIUS}m, 최소체류:{MIN_STAY_MINUTES}분)")
     existing_timestamps, name_tag_memory = sync_fix_and_learn()
     file_list = download_target_files()
     if not file_list: return
 
     for df, filename in file_list:
-        print(f"\n📄 파일 분석: {filename}")
+        print(f"\n📄 파일 분석 시작: {filename}")
         df.columns = df.columns.str.strip().str.lower()
         if 'time' not in df.columns and 'date' in df.columns: df['time'] = df['date'] + ' ' + df['time']
         df['datetime'] = pd.to_datetime(df['time'])
