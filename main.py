@@ -15,21 +15,16 @@ from googleapiclient.http import MediaIoBaseDownload
 # ==================================================
 # 설정
 # ==================================================
-STAY_TIME_MIN = 10          # 최소 체류 시간 (분)
-STAY_RADIUS = 30            # 체류 반경 (m)
+STAY_TIME_MIN = 10
+STAY_RADIUS = 30
 SMOOTHING_WINDOW = 3
 ACCURACY_LIMIT = 50
 
 # ==================================================
-# 환경 변수 / 비밀키
+# 환경 변수
 # ==================================================
 try:
-    from secrets import (
-        MY_KAKAO_KEY,
-        MY_FOLDER_ID,
-        MY_NOTION_KEY,
-        MY_NOTION_DB_ID
-    )
+    from secrets import MY_KAKAO_KEY, MY_FOLDER_ID, MY_NOTION_KEY, MY_NOTION_DB_ID
     GDRIVE_SA_KEY = None
     print("💻 로컬 모드")
 except ImportError:
@@ -62,7 +57,7 @@ def haversine(lat1, lon1, lat2, lon2):
     p1, p2 = math.radians(lat1), math.radians(lat2)
     dp = math.radians(lat2 - lat1)
     dl = math.radians(lon2 - lon1)
-    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
     return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 def format_duration(mins):
@@ -72,9 +67,9 @@ def format_duration(mins):
     return f"{h}시간 {m}분" if h else f"{m}분"
 
 # ==================================================
-# Notion 기존 기록 로드 (중복 방지)
+# Notion 기존 방문 시작시각 로드
 # ==================================================
-def load_existing_notion_starts():
+def load_existing_starts():
     url = f"https://api.notion.com/v1/databases/{MY_NOTION_DB_ID}/query"
     headers = {
         "Authorization": f"Bearer {MY_NOTION_KEY}",
@@ -82,12 +77,12 @@ def load_existing_notion_starts():
         "Content-Type": "application/json"
     }
 
-    res = requests.post(url, headers=headers).json()
+    resp = requests.post(url, headers=headers).json()
     starts = []
 
-    for r in res.get("results", []):
+    for r in resp.get("results", []):
         d = r["properties"]["방문일시"]["date"]
-        if d and d["start"]:
+        if d and d.get("start"):
             dt = parser.parse(d["start"])
             if dt.tzinfo:
                 dt = dt.astimezone(None).replace(tzinfo=None)
@@ -106,19 +101,20 @@ def get_place(lat, lon):
         return PLACE_CACHE[key]
 
     headers = {"Authorization": f"KakaoAK {MY_KAKAO_KEY}"}
-    r = requests.get(
+    resp = requests.get(
         "https://dapi.kakao.com/v2/local/geo/coord2address.json",
         headers=headers,
         params={"x": lon, "y": lat},
         timeout=5
     ).json()
 
-    doc = r["documents"][0]
+    doc = resp["documents"][0]
     addr = (
         doc["road_address"]["address_name"]
         if doc["road_address"]
         else doc["address"]["address_name"]
     )
+
     name = (
         doc["road_address"]["building_name"]
         if doc["road_address"] and doc["road_address"]["building_name"]
@@ -129,48 +125,48 @@ def get_place(lat, lon):
     return name, addr
 
 # ==================================================
-# 체류 감지 (1차)
+# 체류 감지
 # ==================================================
 def detect_stays(df):
     stays = []
-    window = []
+    buf = []
 
     for r in df.itertuples():
-        window.append(r)
-        duration = (window[-1].datetime - window[0].datetime).total_seconds() / 60
+        buf.append(r)
 
+        duration = (buf[-1].datetime - buf[0].datetime).total_seconds() / 60
         if duration < STAY_TIME_MIN:
             continue
 
         max_dist = max(
             haversine(
-                window[0].smooth_lat,
-                window[0].smooth_lon,
+                buf[0].smooth_lat,
+                buf[0].smooth_lon,
                 p.smooth_lat,
                 p.smooth_lon
             )
-            for p in window
+            for p in buf
         )
 
         if max_dist <= STAY_RADIUS:
             stays.append({
-                "start": window[0].datetime,
-                "end": window[-1].datetime,
+                "start": buf[0].datetime,
+                "end": buf[-1].datetime,
                 "duration": duration,
-                "lat": sum(p.smooth_lat for p in window) / len(window),
-                "lon": sum(p.smooth_lon for p in window) / len(window)
+                "lat": sum(p.smooth_lat for p in buf) / len(buf),
+                "lon": sum(p.smooth_lon for p in buf) / len(buf)
             })
-            window = []
+            buf = []
         else:
-            window.pop(0)
+            buf.pop(0)
 
     return stays
 
 # ==================================================
-# 🔥 핵심: 같은 장소 + 같은 날짜 → 1개로 병합
+# 같은 장소 + 같은 날짜 병합
 # ==================================================
-def merge_daily_stays(stays):
-    bucket = defaultdict(list)
+def merge_daily(stays):
+    groups = defaultdict(list)
 
     for s in stays:
         key = (
@@ -178,10 +174,10 @@ def merge_daily_stays(stays):
             round(s["lon"], 5),
             s["start"].date()
         )
-        bucket[key].append(s)
+        groups[key].append(s)
 
     merged = []
-    for items in bucket.values():
+    for items in groups.values():
         items.sort(key=lambda x: x["start"])
         merged.append({
             "start": items[0]["start"],
@@ -194,7 +190,7 @@ def merge_daily_stays(stays):
     return merged
 
 # ==================================================
-# Google Drive 파일 다운로드
+# Google Drive 다운로드
 # ==================================================
 def download_files():
     service = build("drive", "v3", credentials=get_credentials())
@@ -208,12 +204,13 @@ def download_files():
 
     dfs = []
 
-    for f in res["files"]:
+    for f in res.get("files", []):
         fh = io.BytesIO()
 
         if f["mimeType"] == "application/vnd.google-apps.spreadsheet":
             req = service.files().export_media(
-                fileId=f["id"], mimeType="text/csv"
+                fileId=f["id"],
+                mimeType="text/csv"
             )
         else:
             req = service.files().get_media(fileId=f["id"])
@@ -255,4 +252,43 @@ def send_to_notion(v):
         "https://api.notion.com/v1/pages",
         headers={
             "Authorization": f"Bearer {MY_NOTION_KEY}",
-            "Notion-Version"
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        },
+        json=payload
+    )
+
+# ==================================================
+# MAIN
+# ==================================================
+def main():
+    existing_starts = load_existing_starts()
+    dfs = download_files()
+
+    for df in dfs:
+        df.columns = df.columns.str.lower()
+        df["datetime"] = pd.to_datetime(df["time"]).dt.tz_localize(None)
+        df = df.sort_values("datetime")
+
+        if "accuracy" in df.columns:
+            df = df[df["accuracy"] <= ACCURACY_LIMIT]
+
+        df["smooth_lat"] = df["lat"].rolling(
+            SMOOTHING_WINDOW, center=True, min_periods=1
+        ).mean()
+        df["smooth_lon"] = df["lon"].rolling(
+            SMOOTHING_WINDOW, center=True, min_periods=1
+        ).mean()
+
+        stays = merge_daily(detect_stays(df))
+
+        for s in stays:
+            if any(abs((s["start"] - e).total_seconds()) < 300 for e in existing_starts):
+                continue
+
+            name, addr = get_place(s["lat"], s["lon"])
+            send_to_notion({**s, "name": name, "addr": addr})
+
+# ==================================================
+if __name__ == "__main__":
+    main()
