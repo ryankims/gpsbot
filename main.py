@@ -11,13 +11,10 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
 # ================= [비밀번호 로드: 하이브리드 방식] =================
-# 1. 먼저 내 컴퓨터(secrets.py)에 있는지 확인해봅니다.
 try:
     from secrets import MY_KAKAO_KEY, MY_FOLDER_ID, MY_NOTION_KEY, MY_NOTION_DB_ID
-    GDRIVE_SA_KEY = None # 로컬에서는 파일로 처리하므로 변수는 비워둠
+    GDRIVE_SA_KEY = None 
     print("💻 내 컴퓨터 모드로 실행합니다. (secrets.py 사용)")
-
-# 2. 없으면(Github 서버라면) 환경변수(Secrets)에서 가져옵니다.
 except ImportError:
     MY_KAKAO_KEY = os.environ.get("KAKAO_API_KEY")
     MY_FOLDER_ID = os.environ.get("GDRIVE_FOLDER_ID")
@@ -25,7 +22,6 @@ except ImportError:
     MY_NOTION_DB_ID = os.environ.get("NOTION_DB_ID")
     GDRIVE_SA_KEY = os.environ.get("GDRIVE_SA_KEY")
     print("☁️ Github 서버 모드로 실행합니다. (Secrets 사용)")
-
 # ===================================================================
 
 # [기본 규칙]
@@ -40,13 +36,11 @@ SMOOTHING_WINDOW = 3
 ACCURACY_LIMIT = 50
 STAY_RADIUS = 100
 MIN_STAY_MINUTES = 5
+MERGE_TIME_GAP_MINUTES = 30  # [추가] 30분 이내 재방문은 같은 방문으로 처리
 
 def get_credentials():
-    # 1. (내 컴퓨터) service_account.json 파일이 있으면 사용
     if os.path.exists('service_account.json'):
         return service_account.Credentials.from_service_account_file('service_account.json', scopes=['https://www.googleapis.com/auth/drive.readonly'])
-    
-    # 2. (Github 서버) 환경변수에 내용이 들어있으면 사용
     elif GDRIVE_SA_KEY:
         info = json.loads(GDRIVE_SA_KEY)
         return service_account.Credentials.from_service_account_info(info, scopes=['https://www.googleapis.com/auth/drive.readonly'])
@@ -241,6 +235,74 @@ def download_latest_file():
     fh.seek(0)
     return pd.read_csv(fh), target_file['name']
 
+# [신규 함수] 1차 필터링: 거리 기반 클러스터링
+def process_clustering(df):
+    points = df.to_dict('records')
+    if not points: return []
+    
+    raw_visits = []
+    anchor = points[0]
+    cluster = [anchor]
+
+    for i in range(1, len(points)):
+        curr = points[i]
+        dist = haversine(anchor['smooth_lat'], anchor['smooth_lon'], curr['smooth_lat'], curr['smooth_lon'])
+
+        if dist < STAY_RADIUS:
+            cluster.append(curr)
+        else:
+            start_t = cluster[0]['datetime']; end_t = cluster[-1]['datetime']
+            duration = (end_t - start_t).total_seconds() / 60
+
+            if duration >= MIN_STAY_MINUTES:
+                avg_lat = sum(p['smooth_lat'] for p in cluster) / len(cluster)
+                avg_lon = sum(p['smooth_lon'] for p in cluster) / len(cluster)
+                api_name, api_addr = get_geo_info(avg_lat, avg_lon)
+                
+                raw_visits.append({
+                    'place_name': api_name, 'address': api_addr, 'lat': avg_lat, 'lon': avg_lon,
+                    'start': start_t, 'end': end_t, 'duration': duration
+                })
+            anchor = curr; cluster = [curr]
+
+    if cluster:
+        start_t = cluster[0]['datetime']; end_t = cluster[-1]['datetime']
+        duration = (end_t - start_t).total_seconds() / 60
+        if duration >= MIN_STAY_MINUTES:
+            avg_lat = sum(p['smooth_lat'] for p in cluster) / len(cluster)
+            avg_lon = sum(p['smooth_lon'] for p in cluster) / len(cluster)
+            api_name, api_addr = get_geo_info(avg_lat, avg_lon)
+            raw_visits.append({
+                'place_name': api_name, 'address': api_addr, 'lat': avg_lat, 'lon': avg_lon,
+                'start': start_t, 'end': end_t, 'duration': duration
+            })
+            
+    return raw_visits
+
+# [신규 함수] 2차 필터링: 연속된 장소 병합 (핵심 로직)
+def merge_consecutive_visits(visits):
+    if not visits: return []
+    merged = [visits[0]]
+    
+    for current in visits[1:]:
+        last = merged[-1]
+        
+        # 1. 이름이 같거나 주소가 같음
+        is_same_place = (current['place_name'] == last['place_name']) or \
+                        (current['address'].replace(" ", "") == last['address'].replace(" ", ""))
+        
+        # 2. 시간 차이가 허용 범위(30분) 이내
+        time_gap = (current['start'] - last['end']).total_seconds() / 60
+        
+        if is_same_place and time_gap <= MERGE_TIME_GAP_MINUTES:
+            last['end'] = current['end'] # 종료 시간 연장
+            last['duration'] = (last['end'] - last['start']).total_seconds() / 60 # 시간 재계산
+            print(f"🧩 병합됨: {last['place_name']} (중간 {int(time_gap)}분 공백 무시)")
+        else:
+            merged.append(current)
+            
+    return merged
+
 def main():
     print("🚀 [GPS 분석기] 하이브리드 모드 가동...")
     
@@ -252,8 +314,13 @@ def main():
     df, filename = data
     df.columns = df.columns.str.strip().str.lower()
     
-    if 'time' not in df.columns and 'date' in df.columns: df['time'] = df['date'] + ' ' + df['time']
+    if 'time' not in df.columns and 'date' in df.columns: 
+        df['time'] = df['date'] + ' ' + df['time']
     df['datetime'] = pd.to_datetime(df['time'])
+
+    # [KST 보정] CSV가 UTC라면 한국 시간으로 맞춤 (필요시 주석 해제/삭제)
+    df['datetime'] = df['datetime'] + timedelta(hours=9)
+    
     df = df.sort_values('datetime')
     if 'accuracy' in df.columns: df = df[df['accuracy'] <= ACCURACY_LIMIT]
     if len(df) == 0: print("❌ 유효한 데이터가 없습니다."); return
@@ -261,35 +328,18 @@ def main():
     df['smooth_lat'] = df['lat'].rolling(window=SMOOTHING_WINDOW, min_periods=1, center=True).mean()
     df['smooth_lon'] = df['lon'].rolling(window=SMOOTHING_WINDOW, min_periods=1, center=True).mean()
 
-    points = df.to_dict('records')
-    if not points: return
-    anchor = points[0]; cluster = [anchor]
+    # 1단계: 기본 클러스터링
+    print("running 1st clustering...")
+    raw_visits = process_clustering(df)
     
-    for i in range(1, len(points)):
-        curr = points[i]
-        dist = haversine(anchor['smooth_lat'], anchor['smooth_lon'], curr['smooth_lat'], curr['smooth_lon'])
-        
-        if dist < STAY_RADIUS: cluster.append(curr)
-        else:
-            start_t = cluster[0]['datetime']; end_t = cluster[-1]['datetime']
-            duration = (end_t - start_t).total_seconds() / 60
-            if duration >= MIN_STAY_MINUTES:
-                avg_lat = sum(p['smooth_lat'] for p in cluster) / len(cluster)
-                avg_lon = sum(p['smooth_lon'] for p in cluster) / len(cluster)
-                api_name, api_addr = get_geo_info(avg_lat, avg_lon)
-                visit_info = {'place_name': api_name, 'address': api_addr, 'lat': avg_lat, 'lon': avg_lon, 'duration': duration, 'start': start_t, 'end': end_t}
-                send_to_notion(visit_info, existing_timestamps, name_tag_memory)
-            anchor = curr; cluster = [curr]
-            
-    if cluster:
-        start_t = cluster[0]['datetime']; end_t = cluster[-1]['datetime']
-        duration = (end_t - start_t).total_seconds() / 60
-        if duration >= MIN_STAY_MINUTES:
-            avg_lat = sum(p['smooth_lat'] for p in cluster)/len(cluster)
-            avg_lon = sum(p['smooth_lon'] for p in cluster)/len(cluster)
-            api_name, api_addr = get_geo_info(avg_lat, avg_lon)
-            visit_info = {'place_name': api_name, 'address': api_addr, 'lat': avg_lat, 'lon': avg_lon, 'duration': duration, 'start': start_t, 'end': end_t}
-            send_to_notion(visit_info, existing_timestamps, name_tag_memory)
+    # 2단계: 연속 장소 병합
+    print("running 2nd merging...")
+    final_visits = merge_consecutive_visits(raw_visits)
+
+    # 3단계: 노션 전송
+    print(f"📤 총 {len(final_visits)}개의 방문 기록 처리 시작...")
+    for visit in final_visits:
+        send_to_notion(visit, existing_timestamps, name_tag_memory)
 
     print(f"\n🎉 완료!")
 
