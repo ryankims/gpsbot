@@ -11,6 +11,24 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from dateutil import parser
 
+# ================= [설정값 최적화] =================
+AUTO_SWITCH_DATE = date(2026, 1, 10) 
+
+# 너무 좁은 반경은 장소 파편화의 원인이 됩니다. 50m로 원복을 권장합니다.
+STAY_RADIUS = 50       
+MIN_STAY_MINUTES = 5   
+MERGE_TIME_GAP_MINUTES = 30  
+
+IS_CSV_UTC = False  
+SMOOTHING_WINDOW = 3
+ACCURACY_LIMIT = 50
+
+MY_TAG_RULES = {
+    "마트": "🛒 Market", "편의점": "🛒 Market", "학교": "🏫 School", "초등": "🏫 School",
+    "역": "🚆 Station", "카페": "☕ Cafe", "커피": "☕ Cafe", "다이소": "🛍️ Shopping",
+    "집": "🏠 Home", "아파트": "🏠 Home"
+}
+
 # ================= [비밀번호 로드] =================
 try:
     from secrets import MY_KAKAO_KEY, MY_FOLDER_ID, MY_NOTION_KEY, MY_NOTION_DB_ID
@@ -23,24 +41,6 @@ except ImportError:
     MY_NOTION_DB_ID = os.environ.get("NOTION_DB_ID")
     GDRIVE_SA_KEY = os.environ.get("GDRIVE_SA_KEY")
     print("☁️ 서버(Github) 모드로 실행합니다.")
-
-# ================= [핵심 설정값] =================
-AUTO_SWITCH_DATE = date(2026, 1, 10) # 1월 10일부터 최신 파일 1개만 처리
-
-# [사용자 요청 반영]
-STAY_RADIUS = 30       # 반경 50m
-MIN_STAY_MINUTES = 5   # 5분 이상 체류 시 기록
-MERGE_TIME_GAP_MINUTES = 30 
-
-IS_CSV_UTC = False  
-SMOOTHING_WINDOW = 3
-ACCURACY_LIMIT = 50
-
-MY_TAG_RULES = {
-    "마트": "🛒 Market", "편의점": "🛒 Market", "학교": "🏫 School", "초등": "🏫 School",
-    "역": "🚆 Station", "카페": "☕ Cafe", "커피": "☕ Cafe", "다이소": "🛍️ Shopping",
-    "집": "🏠 Home", "아파트": "🏠 Home"
-}
 
 # ================= [기능 함수] =================
 def get_credentials():
@@ -70,9 +70,9 @@ def sync_fix_and_learn():
     url = f"https://api.notion.com/v1/databases/{MY_NOTION_DB_ID}/query"
     headers = {"Authorization": f"Bearer {MY_NOTION_KEY}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     
-    payload = {"page_size": 300, "sorts": [{"property": "방문일시", "direction": "descending"}]}
+    payload = {"page_size": 100, "sorts": [{"property": "방문일시", "direction": "descending"}]}
     
-    existing_timestamps = set() 
+    existing_records = [] # (start_time, end_time, place_name)
     name_tag_memory = {} 
     
     try:
@@ -82,19 +82,21 @@ def sync_fix_and_learn():
             for page in results:
                 props = page.get("properties", {})
                 date_prop = props.get("방문일시", {}).get("date", {})
-                if date_prop and date_prop.get("start"):
-                    dt = parser.parse(date_prop["start"]).replace(tzinfo=None, second=0, microsecond=0)
-                    existing_timestamps.add(dt)
-                
                 title_prop = props.get("이름", {}).get("title", [])
                 p_name = title_prop[0].get("text", {}).get("content", "") if title_prop else ""
+
+                if date_prop and date_prop.get("start"):
+                    s_dt = parser.parse(date_prop["start"]).replace(tzinfo=None)
+                    e_dt = parser.parse(date_prop["end"]).replace(tzinfo=None) if date_prop.get("end") else s_dt
+                    existing_records.append({'start': s_dt, 'end': e_dt, 'name': p_name})
+                
                 tag_prop = props.get("태그", {}).get("multi_select", [])
                 if p_name and tag_prop:
                     name_tag_memory[p_name] = tag_prop[0]['name']
-            print(f"📊 기존 기록 {len(existing_timestamps)}개 로드 완료.")
+            print(f"📊 기존 기록 {len(existing_records)}개 로드 완료.")
     except Exception as e:
         print(f"⚠️ 노션 읽기 에러: {e}")
-    return existing_timestamps, name_tag_memory
+    return existing_records, name_tag_memory
 
 def get_geo_info(lat, lng):
     headers = {"Authorization": f"KakaoAK {MY_KAKAO_KEY}"}
@@ -124,11 +126,14 @@ def get_geo_info(lat, lng):
     if not place_name: place_name = address_str
     return place_name, address_str
 
-def send_to_notion(visit_data, existing_timestamps, name_tag_memory):
-    check_dt = visit_data['start'].replace(tzinfo=None, second=0, microsecond=0)
-    if check_dt in existing_timestamps:
-        print(f"🛡️ [중복 차단] {visit_data['place_name']} ({check_dt.strftime('%m/%d %H:%M')})")
-        return
+def send_to_notion(visit_data, existing_records, name_tag_memory):
+    new_start = visit_data['start'].replace(tzinfo=None)
+    
+    # 중복 체크 강화: 시간대가 5분 이내로 겹치면 중복 처리
+    for rec in existing_records:
+        if abs((new_start - rec['start']).total_seconds()) < 300:
+            print(f"🛡️ [중복 차단] {visit_data['place_name']} ({new_start.strftime('%m/%d %H:%M')})")
+            return
 
     final_tag = "📍 기타"
     if visit_data['place_name'] in name_tag_memory:
@@ -156,59 +161,44 @@ def send_to_notion(visit_data, existing_timestamps, name_tag_memory):
     try:
         resp = requests.post(url, headers=headers, json=payload)
         if resp.status_code == 200:
-            print(f"✅ 등록: {visit_data['place_name']} ({check_dt.strftime('%H:%M')})")
-            existing_timestamps.add(check_dt)
+            print(f"✅ 등록: {visit_data['place_name']} ({new_start.strftime('%H:%M')})")
+            existing_records.append({'start': new_start, 'name': visit_data['place_name']})
         else: print(f"❌ 실패: {resp.text}")
     except Exception as e: print(f"❌ 에러: {e}")
 
-# [핵심 수정] 403 에러 방지를 위해 구글 시트 형식 대응 로직 추가
 def download_target_files():
     creds = get_credentials()
     if not creds: return []
     service = build('drive', 'v3', credentials=creds)
     
-    today = datetime.now().date()
-    if today < AUTO_SWITCH_DATE:
-        query_params = {'orderBy': 'createdTime asc', 'pageSize': 100}
-        print("📂 [전체 모드] 모든 과거 파일을 처리합니다.")
-    else:
-        query_params = {'orderBy': 'createdTime desc', 'pageSize': 1}
-        print("📂 [최신 모드] 최신 파일 1개만 처리합니다.")
-
     results = service.files().list(
         q=f"'{MY_FOLDER_ID}' in parents and trashed=false",
         fields="files(id, name, mimeType, createdTime)",
-        **query_params
+        orderBy='createdTime desc',
+        pageSize=1 # 일단 가장 최신 파일 하나만 정확히 처리합시다
     ).execute()
     
     items = results.get('files', [])
     downloaded_files = []
     
     for item in items:
-        # CSV 확장자이거나 구글 스프레드시트 타입인 경우만 다운로드 시도
         if not (item['name'].lower().endswith('.csv') or item['mimeType'] == 'application/vnd.google-apps.spreadsheet'):
             continue
-            
         print(f"   ⬇️ 다운로드 중: {item['name']}")
         fh = io.BytesIO()
         try:
-            # 구글 스프레드시트 형식일 경우 export_media 사용 (403 에러 방지)
             if item['mimeType'] == 'application/vnd.google-apps.spreadsheet':
                 request = service.files().export_media(fileId=item['id'], mimeType='text/csv')
             else:
                 request = service.files().get_media(fileId=item['id'])
-                
             downloader = MediaIoBaseDownload(fh, request)
             done = False
-            while done is False:
-                status, done = downloader.next_chunk()
-            
+            while done is False: status, done = downloader.next_chunk()
             fh.seek(0)
             df = pd.read_csv(fh, encoding='utf-8-sig')
             downloaded_files.append((df, item['name']))
         except Exception as e:
             print(f"   ❌ {item['name']} 다운로드 실패: {e}")
-            
     return downloaded_files
 
 def process_clustering(df):
@@ -228,13 +218,6 @@ def process_clustering(df):
                 api_name, api_addr = get_geo_info(avg_lat, avg_lon)
                 raw_visits.append({'place_name': api_name, 'address': api_addr, 'lat': avg_lat, 'lon': avg_lon, 'start': start_t, 'end': end_t, 'duration': duration})
             anchor = curr; cluster = [curr]
-    if cluster:
-        start_t = cluster[0]['datetime']; end_t = cluster[-1]['datetime']
-        duration = (end_t - start_t).total_seconds() / 60
-        if duration >= MIN_STAY_MINUTES:
-            avg_lat = sum(p['smooth_lat'] for p in cluster) / len(cluster); avg_lon = sum(p['smooth_lon'] for p in cluster) / len(cluster)
-            api_name, api_addr = get_geo_info(avg_lat, avg_lon)
-            raw_visits.append({'place_name': api_name, 'address': api_addr, 'lat': avg_lat, 'lon': avg_lon, 'start': start_t, 'end': end_t, 'duration': duration})
     return raw_visits
 
 def merge_consecutive_visits(visits):
@@ -242,7 +225,8 @@ def merge_consecutive_visits(visits):
     merged = [visits[0]]
     for current in visits[1:]:
         last = merged[-1]
-        is_same_place = (current['place_name'] == last['place_name']) or (current['address'].replace(" ", "") == last['address'].replace(" ", ""))
+        # 장소명이 같거나 주소가 유사하면 병합
+        is_same_place = (current['place_name'] == last['place_name']) or (current['address'][:10] == last['address'][:10])
         time_gap = (current['start'] - last['end']).total_seconds() / 60
         if is_same_place and time_gap <= MERGE_TIME_GAP_MINUTES:
             last['end'] = current['end']; last['duration'] = (last['end'] - last['start']).total_seconds() / 60
@@ -250,28 +234,22 @@ def merge_consecutive_visits(visits):
     return merged
 
 def main():
-    print(f"🚀 GPS 분석기 v2.3 (반경:{STAY_RADIUS}m, 최소체류:{MIN_STAY_MINUTES}분)")
-    existing_timestamps, name_tag_memory = sync_fix_and_learn()
+    print(f"🚀 GPS 분석기 안정화 버전 (반경:{STAY_RADIUS}m)")
+    existing_records, name_tag_memory = sync_fix_and_learn()
     file_list = download_target_files()
-    if not file_list: return
-
+    
     for df, filename in file_list:
-        print(f"\n📄 파일 분석 시작: {filename}")
         df.columns = df.columns.str.strip().str.lower()
         if 'time' not in df.columns and 'date' in df.columns: df['time'] = df['date'] + ' ' + df['time']
         df['datetime'] = pd.to_datetime(df['time'])
-        if IS_CSV_UTC: df['datetime'] = df['datetime'] + timedelta(hours=9)
         df = df.sort_values('datetime')
         if 'accuracy' in df.columns: df = df[df['accuracy'] <= ACCURACY_LIMIT]
-        if len(df) == 0: continue
         df['smooth_lat'] = df['lat'].rolling(window=SMOOTHING_WINDOW, min_periods=1, center=True).mean()
         df['smooth_lon'] = df['lon'].rolling(window=SMOOTHING_WINDOW, min_periods=1, center=True).mean()
         
         final_visits = merge_consecutive_visits(process_clustering(df))
         for visit in final_visits:
-            send_to_notion(visit, existing_timestamps, name_tag_memory)
-
-    print(f"\n🎉 모든 작업이 완료되었습니다!")
+            send_to_notion(visit, existing_records, name_tag_memory)
 
 if __name__ == "__main__":
     main()
