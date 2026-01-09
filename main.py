@@ -28,8 +28,8 @@ except ImportError:
 AUTO_SWITCH_DATE = date(2026, 1, 10) # 1월 10일부터 최신 파일 1개만 처리
 
 # [사용자 요청 반영]
-STAY_RADIUS = 70       # 반경 50m
-MIN_STAY_MINUTES = 10   # 5분 이상 체류 시 기록
+STAY_RADIUS = 30       # 반경 50m
+MIN_STAY_MINUTES = 5   # 5분 이상 체류 시 기록
 MERGE_TIME_GAP_MINUTES = 30 
 
 IS_CSV_UTC = False  
