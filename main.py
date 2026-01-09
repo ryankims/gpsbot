@@ -12,7 +12,7 @@ from googleapiclient.http import MediaIoBaseDownload
 # ================== 사용자 설정 (다시 확인하세요!) ==================
 GDRIVE_FOLDER_ID = "10tC3MvA9gzjv1E3rdBDi6ZyMaf4lSEni"
 # ⚠️ 주의: 키를 다시 복사해서 붙여넣을 때 앞뒤 공백이 없는지 꼭 확인하세요!
-NOTION_KEY = "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"
+NOTION_KEY = os.environ.get("NOTION_KEY")
 NOTION_DB_ID = "2ddb9d7d1d4a81028e19d09a1386f820"
 # ===============================================================
 
