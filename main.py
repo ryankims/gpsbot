@@ -52,14 +52,23 @@ def download_all_csv():
     ).execute()
 
     dfs = []
-    for f in results["files"]:
+
+    for f in results.get("files", []):
         if not f["name"].lower().endswith(".csv"):
             continue
 
         fh = io.BytesIO()
-        request = service.files().get_media(fileId=f["id"])
-        downloader = MediaIoBaseDownload(fh, request)
 
+        # 🔥 핵심 분기
+        if f["mimeType"].startswith("application/vnd.google-apps"):
+            request = service.files().export_media(
+                fileId=f["id"],
+                mimeType="text/csv"
+            )
+        else:
+            request = service.files().get_media(fileId=f["id"])
+
+        downloader = MediaIoBaseDownload(fh, request)
         done = False
         while not done:
             _, done = downloader.next_chunk()
@@ -67,7 +76,11 @@ def download_all_csv():
         fh.seek(0)
         dfs.append(pd.read_csv(fh))
 
+    if not dfs:
+        raise RuntimeError("❌ CSV 데이터를 하나도 불러오지 못했습니다.")
+
     return pd.concat(dfs, ignore_index=True)
+
 
 
 def send_to_notion(summary):
